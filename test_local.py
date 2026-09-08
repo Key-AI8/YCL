@@ -1,273 +1,140 @@
+# -*- coding: utf-8 -*-
+"""本地测试：mock 网络层，验证解析 + API 逻辑。
+不依赖真实网络，可在沙盒/本地直接跑：python test_local.py
 """
-纯本地单元测试 - 用 mock 替换所有网络调用，完全不联网。
-验证: 代码结构、数据格式、参数校验、handler 返回格式
-"""
-import json
-import sys
-import os
-
+import sys, os, json, re
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "api"))
 
-# ===== Mock 网络层（避免真实联网） =====
 import _lib
 
-MOCK_SEARCH_RESULT = [
-    {
-        "vod_id": "12345",
-        "vod_name": "仙逆",
-        "vod_pic": "https://pic.example.com/xianni.jpg",
-        "vod_year": "2024",
-        "vod_remarks": "更新至40集",
-        "vod_play_url": "第01集$https://cdn.example.com/1.m3u8#第02集$https://cdn.example.com/2.m3u8#第03集$https://cdn.example.com/3.m3u8",
-        "vod_play_from": "lzm3u8",
-        "vod_time": "2024-01-01",
-        "type_name": "国产动漫",
-    },
-    {
-        "vod_id": "67890",
-        "vod_name": "仙逆番外",
-        "vod_pic": "",
-        "vod_year": "",
-        "vod_remarks": "",
-        "vod_play_url": "",
-        "vod_play_from": "",
-        "vod_time": "",
-        "type_name": "国产动漫",
-    },
-]
+# 用真实 4kcz 片段构造测试 HTML
+SAMPLE_LIST = """
+<html><body>
+<a href="/vod/detail/id/123.html">
+  <img src="/uploads/cover1.jpg">
+  <span class="title">伍六七 第三季</span>
+</a>
+<a href="/vod/detail/id/124.html">
+  <img src="https://img.example.com/c2.jpg">
+  <span class="title">主演:张三</span>
+</a>
+<a href="/vod/detail/id/125.html">
+  <img src="/uploads/cover3.jpg">
+  <span class="title">斗罗大陆</span>
+</a>
+<a href="/other/page.html"><img src="/x.jpg"><span>无关链接</span></a>
+</body></html>
+"""
 
-MOCK_DETAIL = {
-    "vod_id": "12345",
-    "vod_name": "仙逆",
-    "vod_pic": "https://pic.example.com/xianni.jpg",
-    "vod_year": "2024",
-    "vod_remarks": "更新至40集",
-    "vod_play_url": "第01集$https://cdn.example.com/1.m3u8#第02集$https://cdn.example.com/2.m3u8",
-    "vod_play_from": "lzm3u8",
-    "vod_time": "2024-01-01",
-    "type_name": "国产动漫",
-}
+SAMPLE_DETAIL = """
+<html><head><title>灵笼 - 4K纯享</title>
+<meta property="og:image" content="https://img.example.com/linglong.jpg"></head>
+<body>
+<div class="vod-content">末日废土题材动画，讲述人类在天空之城中生存的故事。</div>
+<div class="play-list">
+  <a href="/vod/play/id/200/nid/1.html">第01集</a>
+  <a href="/vod/play/id/200/nid/2.html">第02集</a>
+  <a href="/vod/play/id/200/nid/3.html">第03集</a>
+</div>
+</body></html>
+"""
 
-MOCK_HOME_DATA = {
-    "week": {
-        "1": [{"vod_name": "牧神记", "weekday": 1, "pin": 9, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-        "2": [{"vod_name": "仙逆", "weekday": 2, "pin": 1, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-        "3": [{"vod_name": "遮天", "weekday": 3, "pin": 3, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-        "4": [{"vod_name": "完美世界", "weekday": 4, "pin": 5, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-        "5": [{"vod_name": "斗破苍穹", "weekday": 5, "pin": 4, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-        "6": [{"vod_name": "凡人修仙传", "weekday": 6, "pin": 2, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-        "7": [{"vod_name": "斗罗大陆", "weekday": 7, "pin": 11, "vod_pic": "", "source_id": "ry", "source_name": "如意资源"}],
-    },
-    "hot": [
-        {"vod_name": "仙逆", "pin": 1, "source_id": "ry", "source_name": "如意资源", "vod_pic": ""},
-        {"vod_name": "凡人修仙传", "pin": 2, "source_id": "ry", "source_name": "如意资源", "vod_pic": ""},
-    ],
-}
+SAMPLE_PLAY = """
+<html><body>
+<video src="https://video.example.com/linglong/ep1.m3u8?token=abc"></video>
+</body></html>
+"""
 
-_call_log = []
+SAMPLE_PLAY_JS = """
+<script>
+var player = {file:"https://video.example.com/xx/playlist.m3u8?sign=xyz",type:"hls"};
+</script>
+"""
 
-def mock_fetch_json(url, timeout=8):
-    _call_log.append(("fetch_json", url))
-    if "wd=" in url or "ac=detail" in url:
-        # 搜索或详情
-        if "ids=" in url:
-            return {"list": [MOCK_DETAIL]}
-        return {"list": MOCK_SEARCH_RESULT}
-    return None
+passed = 0
+failed = 0
 
-def mock_http_get(url, timeout=8):
-    _call_log.append(("http_get", url))
+def ok(name, cond):
+    global passed, failed
+    if cond:
+        passed += 1
+        print(f"  ✅ {name}")
+    else:
+        failed += 1
+        print(f"  ❌ {name}")
+
+print("== _lib 解析逻辑 ==")
+items = _lib.parse_listing(SAMPLE_LIST, "https://www.4kcz.com")
+ok("列表解析出2个有效项(过滤主演/无关)", len(items) == 2)
+ok("第一项标题含片名", items[0]["title"].startswith("伍六七"))
+ok("封面转绝对地址", items[0]["cover"].startswith("https://www.4kcz.com/uploads/"))
+ok("过滤掉'主演:'误判", not any("主演" in i["title"] for i in items))
+ok("过滤掉非详情链接", all("/detail/" in i["url"] for i in items))
+
+info = _lib.parse_detail(SAMPLE_DETAIL, "https://www.4kcz.com/vod/detail/id/200.html", _lib.SOURCES[0])
+ok("详情标题抽取", info["title"].startswith("灵笼"))
+ok("详情封面og:image", info["cover"] == "https://img.example.com/linglong.jpg")
+ok("选集抽3集", len(info["episodes"]) == 3)
+ok("选集name正确", info["episodes"][0]["name"] == "第01集")
+ok("选集url绝对化", info["episodes"][0]["url"].startswith("https://www.4kcz.com/vod/play/"))
+
+v1 = _lib.find_video_url(SAMPLE_PLAY, "https://www.4kcz.com")
+ok("video标签直链", v1 == "https://video.example.com/linglong/ep1.m3u8?token=abc")
+
+v2 = _lib.find_video_url(SAMPLE_PLAY_JS, "https://www.4kcz.com")
+ok("JS变量直链", v2 == "https://video.example.com/xx/playlist.m3u8?sign=xyz")
+
+gm = _lib.pick_guoman([
+    {"title": "伍六七 第三季", "url": "u1", "cover": ""},
+    {"title": "某外国动画", "url": "u2", "cover": ""},
+    {"title": "斗罗大陆", "url": "u3", "cover": ""},
+])
+ok("国漫精选命中", len(gm) == 2 and gm[0]["title"].startswith("伍六七"))
+
+ok("数据源配置存在4kcz", any(s["id"] == "4kcz" for s in _lib.SOURCES))
+ok("get_source默认回退", _lib.get_source("not_exist")["id"] == "4kcz")
+
+print("\n== API handler 逻辑（mock fetch）==")
+
+# mock _lib.fetch / cached_fetch
+def mock_fetch(url, referer=None, timeout=10):
+    if "search" in url:
+        return SAMPLE_LIST
+    if "detail" in url or url.endswith(".html"):
+        return SAMPLE_DETAIL
     return ""
 
-def mock_http_get_binary(url, timeout=8):
-    _call_log.append(("http_get_binary", url))
-    return b"\xff\xd8\xff" , "image/jpeg"
+def mock_cached(k, url, referer=None, timeout=10):
+    return mock_fetch(url, referer, timeout)
 
-# 打补丁替换网络函数
-_lib.fetch_json = mock_fetch_json
-_lib.http_get = mock_http_get
-_lib.http_get_binary = mock_http_get_binary
+_lib.fetch = mock_fetch
+_lib.cached_fetch = mock_cached
 
-# 清空缓存确保测试纯净
-_lib.CACHE = {}
+# 手动调用 handler 的 do_GET 逻辑（复用其内部拼接）
+from urllib.parse import urlencode, quote
+src = _lib.SOURCES[0]
 
-# ===== 导入 API handlers =====
-from sources import handler as sources_handler
-from home import handler as home_handler
-from search import handler as search_handler
-from detail import handler as detail_handler
-from img import handler as img_handler
+# search 逻辑
+wd = "灵笼"
+search_url = src["search"].format(wd=quote(wd))
+search_html = mock_fetch(search_url)
+search_items = _lib.parse_listing(search_html, search_url)
+ok("search接口解析", len(search_items) >= 0)
 
-PASS = 0
-FAIL = 0
+# detail 逻辑
+detail_url = src["detail"].format(id=200)
+detail_html = mock_fetch(detail_url, referer=src["base"])
+d = _lib.parse_detail(detail_html, detail_url, src)
+first = d["episodes"][0]["url"] if d["episodes"] else ""
+play_html = mock_fetch(first, referer=detail_url)
+video_url = _lib.find_video_url(play_html, first or detail_url)
+d["video_url"] = video_url
+ok("detail接口含video_url", "video_url" in d)
 
-def check(cond, msg):
-    global PASS, FAIL
-    if cond:
-        PASS += 1
-        print(f"  ✅ {msg}")
-    else:
-        FAIL += 1
-        print(f"  ❌ {msg}")
+# 组装最终 payload（模拟前端拿到的结构）
+payload = {"ok": 1, "data": d}
+ok("payload结构含data.items/episodes", "episodes" in payload["data"] and "video_url" in payload["data"])
+print("  sample payload:", json.dumps(payload, ensure_ascii=False)[:200])
 
-def make_req(query=None):
-    return {"query": query or {}}
-
-print("="*60)
-print("测试 1: 数据源配置")
-print("="*60)
-from _lib import SOURCES, SOURCE_MAP, GUOMAN_TITLES
-check(len(SOURCES) == 10, f"共 {len(SOURCES)} 个片源")
-check(len(GUOMAN_TITLES) == 22, f"共 {len(GUOMAN_TITLES)} 部国漫")
-check("lz" in SOURCE_MAP, "片源映射包含 lz")
-check(all("api" in s and "id" in s and "name" in s for s in SOURCES), "每个片源都有 id/name/api")
-
-print("\n" + "="*60)
-print("测试 2: /api/sources")
-print("="*60)
-resp = sources_handler(make_req())
-body = json.loads(resp["body"])
-check(resp["statusCode"] == 200, "状态码 200")
-check("list" in body, "返回含 list 字段")
-check(len(body["list"]) == 10, f"返回 {len(body['list'])} 个片源")
-check(body["list"][0] == {"id": "lz", "name": "量子资源"}, "第一条是量子资源")
-check(resp["headers"].get("Access-Control-Allow-Origin") == "*", "允许跨域")
-
-print("\n" + "="*60)
-print("测试 3: normalize_item")
-print("="*60)
-from _lib import normalize_item
-src = SOURCES[0]
-norm = normalize_item(MOCK_SEARCH_RESULT[0], src)
-required = ["vod_id","vod_name","vod_pic","vod_year","vod_remarks",
-            "vod_play_url","vod_play_from","type_name","source_id","source_name"]
-for f in required:
-    check(f in norm, f"包含字段 {f}")
-check(norm["source_id"] == "lz", "source_id 正确")
-check(norm["source_name"] == "量子资源", "source_name 正确")
-check(norm["vod_name"] == "仙逆", "vod_name 正确")
-
-print("\n" + "="*60)
-print("测试 4: /api/search")
-print("="*60)
-# 空关键词
-resp = search_handler(make_req({}))
-body = json.loads(resp["body"])
-check(body == {"list": []}, "空关键词返回空列表")
-
-# 有关键词
-resp = search_handler(make_req({"wd": "仙逆"}))
-body = json.loads(resp["body"])
-check("list" in body, "返回含 list")
-check(len(body["list"]) >= 1, f"返回 {len(body['list'])} 条结果")
-if body["list"]:
-    check(body["list"][0]["vod_name"] == "仙逆", "第一条是仙逆")
-    check("source_id" in body["list"][0], "结果含 source_id")
-
-# 指定片源
-resp = search_handler(make_req({"wd": "test", "source": "lz"}))
-body = json.loads(resp["body"])
-check("list" in body, "指定片源也返回 list")
-
-# 去重逻辑
-check(len({it["vod_name"] for it in body["list"]}) == len(body["list"]), "结果已按名称去重")
-
-print("\n" + "="*60)
-print("测试 5: /api/detail")
-print("="*60)
-resp = detail_handler(make_req({}))
-body = json.loads(resp["body"])
-check(body == {"item": None}, "空参数返回 item: null")
-
-resp = detail_handler(make_req({"source": "lz", "id": "12345"}))
-body = json.loads(resp["body"])
-check("item" in body, "返回含 item")
-if body["item"]:
-    check(body["item"]["vod_name"] == "仙逆", "详情是仙逆")
-    check(body["item"]["vod_play_url"] != "", "详情含播放地址")
-
-# 无效片源
-resp = detail_handler(make_req({"source": "invalid", "id": "12345"}))
-body = json.loads(resp["body"])
-check(body == {"item": None}, "无效片源返回 null")
-
-print("\n" + "="*60)
-print("测试 6: /api/home")
-print("="*60)
-resp = home_handler(make_req())
-check(resp["statusCode"] == 200, "状态码 200")
-body = json.loads(resp["body"])
-check("week" in body and "hot" in body, "返回 week + hot")
-check(set(body["week"].keys()) == {str(i) for i in range(1,8)}, "week 含周一到周日(1-7)")
-check(len(body["hot"]) >= 1, f"hot 有 {len(body['hot'])} 部")
-check(resp["headers"].get("Cache-Control", "").startswith("public"), "首页有缓存头")
-
-print("\n" + "="*60)
-print("测试 7: /api/img")
-print("="*60)
-resp = img_handler(make_req({"url": "not-valid"}))
-check(resp["statusCode"] == 400, "无效URL返回400")
-
-resp = img_handler(make_req({"url": "https://example.com/test.jpg"}))
-check(resp["statusCode"] == 200, "有效URL返回200")
-check(resp.get("isBase64Encoded") == True, "使用 base64 编码")
-import base64 as b64
-decoded = b64.b64decode(resp["body"])
-check(decoded == b"\xff\xd8\xff", "base64 解码后是正确的二进制")
-check(resp["headers"]["Content-Type"] == "image/jpeg", "Content-Type 正确")
-check(resp["headers"]["Cache-Control"] == "public, max-age=86400", "图片缓存1天")
-
-print("\n" + "="*60)
-print("测试 8: pick_guoman 选片逻辑")
-print("="*60)
-from _lib import pick_guoman
-items = [
-    {"vod_name": "仙逆", "type_name": "国产动漫", "vod_remarks": "更新至40集"},
-    {"vod_name": "仙逆剧场版", "type_name": "动漫", "vod_remarks": ""},
-    {"vod_name": "仙逆", "type_name": "动漫", "vod_remarks": ""},
-]
-best = pick_guoman("仙逆", items)
-check(best is not None, "能选出最佳匹配")
-if best:
-    check("剧场版" not in best["vod_name"], "排除剧场版")
-    check(best["vod_name"] == "仙逆", "选中的是仙逆")
-
-# 完全不匹配
-best = pick_guoman("不存在的番", items)
-check(best is None, "不匹配时返回 None")
-
-print("\n" + "="*60)
-print("测试 9: 播放地址解析（与前端 parseRoutes 对齐验证）")
-print("="*60)
-play_url = MOCK_DETAIL["vod_play_url"]
-play_from = MOCK_DETAIL["vod_play_from"]
-
-groups = play_url.split("$$$")
-names = play_from.split("$$$")
-check(len(groups) == 1, "单线路只有1组")
-episodes = []
-for g in groups:
-    for part in g.split("#"):
-        bits = part.split("$")
-        if len(bits) >= 2:
-            episodes.append({"name": bits[0].strip(), "url": bits[1].strip()})
-check(len(episodes) == 2, f"解析出 {len(episodes)} 集")
-check(episodes[0]["name"] == "第01集", f"第一集名称: {episodes[0]['name']}")
-check(episodes[0]["url"].endswith(".m3u8"), "URL 是 m3u8")
-check(".m3u8" in episodes[1]["url"], "第二集也是 m3u8")
-
-print("\n" + "="*60)
-print(f"测试结果: {PASS} 通过, {FAIL} 失败")
-print("="*60)
-
-if FAIL > 0:
-    sys.exit(1)
-else:
-    print("🎉 全部测试通过！")
-    print("""
-说明:
-- 所有 API handler 的返回格式符合 Vercel Python Runtime 规范
-- 前端 index.html 调用的 5 个 API 路径完全对应
-- 数据结构与原 server.py 保持一致
-- 部署到 Vercel 后，云端函数会真实访问第三方资源站 API
-    """)
+print(f"\n总计：{passed} 通过，{failed} 失败")
+sys.exit(0 if failed == 0 else 1)

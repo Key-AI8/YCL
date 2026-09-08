@@ -1,0 +1,11 @@
+[project]
+name = "yszyl-player"
+version = "1.0.0"
+description = "影视搜索播放器 - Vercel 文件型 Python 函数"
+requires-python = ">=3.12"
+dependencies = []
+
+# 关键：告诉 Vercel 入口在 api/ 目录，使用文件型函数（file-based functions）
+# 这样不会去找 app.py / index.py 全局入口，而是每个 api/*.py 独立成路由
+[tool.vercel]
+entrypoint = "api.sources:handler"
