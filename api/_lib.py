@@ -1,247 +1,248 @@
+# -*- coding: utf-8 -*-
+"""共享解析库：数据源配置、抓取、HTML 解析、缓存、归一化。
+
+所有 api/*.py 都 import 这里的函数，避免重复代码。
+只使用 Python 标准库（urllib, html, re, json, time, threading），
+确保 Vercel Python runtime 无需额外依赖即可运行。
+"""
+import urllib.request
+import urllib.parse
+import urllib.error
 import json
-import re
-import ssl
 import time
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+import re
+import threading
+from html import unescape
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-CTX = ssl.create_default_context()
-
-# Vercel Serverless 是无状态的，进程内缓存在冷启动间不共享，
-# 但仍可在一个实例生命周期内减少重复请求，保留原逻辑即可。
-CACHE = {}
-CACHE_TTL = 300
-
-
-def cache_get(key):
-    hit = CACHE.get(key)
-    if not hit:
-        return None
-    ts, val = hit
-    if time.time() - ts > CACHE_TTL:
-        CACHE.pop(key, None)
-        return None
-    return val
-
-
-def cache_set(key, val):
-    CACHE[key] = (time.time(), val)
-
-
-def http_get(url, timeout=8):
-    req = Request(url, headers={
-        "User-Agent": UA,
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": url,
-    })
-    try:
-        with urlopen(req, timeout=timeout, context=CTX) as resp:
-            data = resp.read()
-            charset = "utf-8"
-            ctype = resp.headers.get("Content-Type", "")
-            m = re.search(r"charset=([\w-]+)", ctype, re.I)
-            if m:
-                charset = m.group(1)
-            return data.decode(charset, "ignore")
-    except (HTTPError, URLError, TimeoutError, OSError):
-        return None
-
-
-def http_get_binary(url, timeout=8):
-    """返回 (bytes, content_type)，失败返回 (None, None)"""
-    req = Request(url, headers={
-        "User-Agent": UA,
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-        "Referer": url,
-    })
-    try:
-        with urlopen(req, timeout=timeout, context=CTX) as resp:
-            data = resp.read()
-            ctype = resp.headers.get("Content-Type", "application/octet-stream")
-            return data, ctype
-    except (HTTPError, URLError, TimeoutError, OSError):
-        return None, None
-
-
-def fetch_json(url, timeout=5):
-    text = http_get(url, timeout=timeout)
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
-
-
+# ---------------------------------------------------------------------------
+# 数据源配置
+# 每个源：首页列表页 + 搜索页模板 + 详情页模板 + 播放页模板
+# ---------------------------------------------------------------------------
 SOURCES = [
-    {"id": "lz", "name": "量子资源", "api": "https://cj.lziapi.com/api.php/provide/vod/from/lzm3u8"},
-    {"id": "bf", "name": "暴风资源", "api": "https://bfzyapi.com/api.php/provide/vod"},
-    {"id": "ff", "name": "非凡资源", "api": "https://cj.ffzyapi.com/api.php/provide/vod"},
-    {"id": "ry", "name": "如意资源", "api": "https://cj.rycjapi.com/api.php/provide/vod"},
-    {"id": "ikun", "name": "iKun资源", "api": "https://ikunzyapi.com/api.php/provide/vod"},
-    {"id": "wj", "name": "无尽资源", "api": "https://api.wujinapi.me/api.php/provide/vod"},
-    {"id": "zd", "name": "最大资源", "api": "https://api.zuidapi.com/api.php/provide/vod"},
-    {"id": "js", "name": "极速资源", "api": "https://jszyapi.com/api.php/provide/vod"},
-    {"id": "dytt", "name": "电影天堂", "api": "http://caiji.dyttzyapi.com/api.php/provide/vod"},
-    {"id": "hn", "name": "红牛资源", "api": "https://www.hongniuzy2.com/api.php/provide/vod"},
+    {
+        "id": "4kcz",
+        "name": "4K 纯享",
+        "base": "https://www.4kcz.com",
+        "home": "https://www.4kcz.com/",
+        "search": "https://www.4kcz.com/vod/search/wd/{wd}.html",
+        "detail": "https://www.4kcz.com/vod/detail/id/{id}.html",
+        "play": "https://www.4kcz.com/vod/play/id/{id}/nid/{nid}.html",
+    },
 ]
 
-SOURCE_MAP = {s["id"]: s for s in SOURCES}
-
+# 国漫标题（用于首页精选，与原 server.py 保持一致）
 GUOMAN_TITLES = [
-    {"name": "仙逆", "weekday": 2, "pin": 1},
-    {"name": "凡人修仙传", "weekday": 6, "pin": 2},
-    {"name": "遮天", "weekday": 3, "pin": 3},
-    {"name": "斗破苍穹", "weekday": 5, "pin": 4},
-    {"name": "完美世界", "weekday": 4, "pin": 5},
-    {"name": "吞噬星空", "weekday": 6, "pin": 6},
-    {"name": "一念永恒", "weekday": 5, "pin": 7},
-    {"name": "剑来", "weekday": 7, "pin": 8},
-    {"name": "牧神记", "weekday": 1, "pin": 9},
-    {"name": "沧元图", "weekday": 6, "pin": 10},
-    {"name": "斗罗大陆", "weekday": 7, "pin": 11},
-    {"name": "神印王座", "weekday": 4, "pin": 12},
-    {"name": "斩神", "weekday": 3, "pin": 13},
-    {"name": "百炼成神", "weekday": 2, "pin": 14},
-    {"name": "灵笼", "weekday": 5, "pin": 15},
-    {"name": "凸变英雄", "weekday": 6, "pin": 16},
-    {"name": "雾山五行", "weekday": 1, "pin": 17},
-    {"name": "狐妖小红娘", "weekday": 4, "pin": 18},
-    {"name": "万界独尊", "weekday": 3, "pin": 19},
-    {"name": "武神主宰", "weekday": 2, "pin": 20},
-    {"name": "星辰变", "weekday": 7, "pin": 21},
-    {"name": "全职高手", "weekday": 1, "pin": 22},
+    "伍六七", "刺客伍六七", "灵笼", "凡人修仙传", "斗罗大陆", "完美世界",
+    "遮天", "斗破苍穹", "大主宰", "武动乾坤", "魔道祖师", "天官赐福",
+    "全职高手", "秦时明月", "画江湖", "不良人", "白蛇缘起", "哪吒",
+    "姜子牙", "大鱼海棠", "罗小黑战记", "镇魂街", "雏蜂", "端脑",
 ]
 
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
-def normalize_item(item, source):
+# 进程内缓存（Serverless 同实例有效）
+_cache = {}
+_lock = threading.Lock()
+CACHE_TTL = 300  # 秒
+
+
+def get_source(source_id):
+    for s in SOURCES:
+        if s["id"] == source_id:
+            return s
+    return SOURCES[0]
+
+
+def fetch(url, referer=None, timeout=10):
+    """抓取 URL，返回解码后的文本。失败返回空字符串。"""
+    headers = {"User-Agent": DEFAULT_UA}
+    if referer:
+        headers["Referer"] = referer
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = resp.read()
+        # 尝试常见编码
+        for enc in ("utf-8", "gbk", "gb2312", "gb18030"):
+            try:
+                return data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return data.decode("utf-8", errors="ignore")
+    except (urllib.error.URLError, TimeoutError, OSError):
+        return ""
+
+
+def cached_fetch(key, url, referer=None, timeout=10):
+    """带 TTL 的缓存抓取。"""
+    now = time.time()
+    with _lock:
+        item = _cache.get(key)
+        if item and now - item[0] < CACHE_TTL:
+            return item[1]
+    text = fetch(url, referer=referer, timeout=timeout)
+    with _lock:
+        _cache[key] = (now, text)
+    return text
+
+
+def make_abs(base, href):
+    """把相对链接转绝对链接。"""
+    if not href:
+        return ""
+    try:
+        return urllib.parse.urljoin(base, href.strip())
+    except Exception:
+        return href
+
+
+def clean_text(s):
+    if not s:
+        return ""
+    return unescape(re.sub(r"<[^>]+>", "", s)).strip()
+
+
+# ---------------------------------------------------------------------------
+# 搜索结果 / 列表页解析
+# 适配苹果CMS体系（4kcz 等）：
+#   - 列表项通常在 .search-item / .vodlist / li 含 a[href] 的结构里
+#   - 通过正则兜底抽取 cover / title / detail url
+# ---------------------------------------------------------------------------
+def parse_listing(html, base):
+    """从列表/搜索页 HTML 中抽取番剧卡片列表。
+
+    策略：先定位所有「详情链接」的 <a>，再在其内部独立抽取封面 <img> 与标题文本，
+    避免封面/标题在 DOM 中顺序不固定导致匹配失败。
+    """
+    items = []
+    seen = set()
+
+    # 第一步：抓所有详情类 <a href>
+    link_pat = re.compile(r'<a\b[^>]+href="(?P<href>[^"]+)"[^>]*>.*?</a>', re.DOTALL)
+    img_pat = re.compile(r'<img\b[^>]+src="(?P<src>[^"]+)"', re.IGNORECASE)
+    title_stop = re.compile(r'<(?:/?(?:span|div|p)|!--)')
+
+    for m in link_pat.finditer(html):
+        href = make_abs(base, m.group("href"))
+        if not href or href in seen:
+            continue
+        if not re.search(r"/(detail|show|vod|play)/", href):
+            continue
+        block = m.group(0)
+
+        # 封面：a 内部第一个 img
+        im = img_pat.search(block)
+        cover = make_abs(base, im.group("src")) if im else ""
+
+        # 标题：a 内部第一个貌似片名的文本节点（去掉封面alt等）
+        # 取所有纯文本，去掉标签，取最长有意义片段
+        text = re.sub(r'<[^>]+>', ' ', block)
+        text = clean_text(text)
+        # 常见分隔清理
+        text = re.split(r'\s*(?:主演|导演|类型|年份|地区|简介|详情|播放|选集)\s*[:：]', text)[0]
+        title = text.strip()
+
+        if not title or len(title) < 2:
+            continue
+        if re.match(r"^(主演|导演|类型|年份|地区|简介|详情|播放|选集|搜索|首页)", title):
+            continue
+
+        seen.add(href)
+        items.append({"title": title, "url": href, "cover": cover})
+
+    return items
+
+
+# ---------------------------------------------------------------------------
+# 详情页解析：抽取选集列表
+# 优先从 "播放地址" 区域抽取 nid 链接；其次抽 <a href> 中含 play 的链接。
+# ---------------------------------------------------------------------------
+def parse_detail(html, base, source):
+    """返回 dict: {title, cover, intro, episodes:[{name, url}]}"""
+    title = ""
+    m = re.search(r'<title>(.*?)</title>', html, re.DOTALL)
+    if m:
+        raw = clean_text(m.group(1)).strip()
+        # 常见 "片名 - 站点" / "片名_xxx" 取第一部分
+        for sep in ["-", "_", "|", "–", "—"]:
+            raw = raw.split(sep)[0].strip()
+        title = raw
+
+    cover = ""
+    cm = re.search(r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"', html)
+    if cm:
+        cover = make_abs(base, cm.group(1))
+    else:
+        im = re.search(r'<img[^>]+class="[^"]*vod-pic[^"]*"[^>]+src="([^"]+)"', html)
+        if im:
+            cover = make_abs(base, im.group(1))
+
+    intro = ""
+    im2 = re.search(r'<div[^>]+class="[^"]*vod-content[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
+    if im2:
+        intro = clean_text(im2.group(1))[:500]
+
+    episodes = []
+    seen = set()
+    # 选集区域：常见 class 含 "playlist / play-list / vod-play-list"
+    play_area = html
+    pam = re.search(r'<div[^>]+class="[^"]*(?:play-list|playlist|vod-play-list)[^"]*"[^>]*>(.*?)</div>\s*</div>', html, re.DOTALL)
+    if pam:
+        play_area = pam.group(1)
+
+    for a in re.finditer(r'<a[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<name>[^<]{1,40})</a>', play_area):
+        href = make_abs(base, a.group("href"))
+        if not href or href in seen:
+            continue
+        if not re.search(r"/(play|ep|video)/", href):
+            continue
+        name = clean_text(a.group("name"))
+        if not name:
+            continue
+        seen.add(href)
+        episodes.append({"name": name, "url": href})
+
     return {
-        "vod_id": item.get("vod_id"),
-        "vod_name": item.get("vod_name") or "",
-        "vod_pic": item.get("vod_pic") or "",
-        "vod_year": item.get("vod_year") or "",
-        "vod_remarks": item.get("vod_remarks") or "",
-        "vod_time": item.get("vod_time") or "",
-        "vod_play_url": item.get("vod_play_url") or "",
-        "vod_play_from": item.get("vod_play_from") or "",
-        "type_name": item.get("type_name") or "",
-        "source_id": source["id"],
-        "source_name": source["name"],
+        "title": title or "未知",
+        "cover": cover,
+        "intro": intro,
+        "episodes": episodes,
     }
 
 
-def search_one(source, keyword):
-    url = source["api"] + "?ac=detail&wd=" + quote(keyword)
-    data = fetch_json(url, timeout=4)
-    if data and data.get("list"):
-        return [normalize_item(it, source) for it in data["list"]]
-    #  fallback: 部分站点用 ?wd= 而非 ?ac=detail&wd=
-    data = fetch_json(source["api"] + "?wd=" + quote(keyword), timeout=4)
-    if data and data.get("list"):
-        return [normalize_item(it, source) for it in data["list"]]
-    return []
+# ---------------------------------------------------------------------------
+# 播放地址抽取：从播放页 HTML / JS 里抠出 m3u8 / mp4 直链
+# ---------------------------------------------------------------------------
+def find_video_url(html, base):
+    """在播放页里找 m3u8 / mp4 直链。"""
+    # 1) 显式 video/source
+    for pat in [
+        r'<source[^>]+src="([^"]+\.(?:m3u8|mp4|webm)(?:\?[^"]*)?)"',
+        r'<video[^>]+src="([^"]+\.(?:m3u8|mp4|webm)(?:\?[^"]*)?)"',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE)
+        if m:
+            return make_abs(base, m.group(1))
+
+    # 2) JS 变量 / 字符串里的直链
+    m = re.search(r'["\']((?:https?:)?//[^"\s]+\.(?:m3u8|mp4|webm)(?:\?[^"\s]*)?)["\']', html, re.IGNORECASE)
+    if m:
+        return make_abs(base, m.group(1))
+    m = re.search(r'(?:file|url|video)\s*[:=]\s*["\']([^"\']+\.(?:m3u8|mp4|webm)(?:\?[^"\s]*)?)["\']', html, re.IGNORECASE)
+    if m:
+        return make_abs(base, m.group(1))
+    return ""
 
 
-def detail_one(source_id, vod_id):
-    source = SOURCE_MAP.get(source_id)
-    if not source or not vod_id:
-        return None
-    data = fetch_json(source["api"] + "?ac=detail&ids=" + quote(str(vod_id)), timeout=8)
-    if data and data.get("list"):
-        return normalize_item(data["list"][0], source)
-    return None
-
-
-def pick_guoman(keyword, items):
-    skip = ("短剧", "剧场版", "电影", "日语", "花魁", "合集")
-    best = None
-    best_score = -1
-    for it in items:
-        name = it.get("vod_name") or ""
-        typ = it.get("type_name") or ""
-        remarks = it.get("vod_remarks") or ""
-        if keyword not in name:
-            continue
-        score = 0
-        if name == keyword:
-            score += 120
-        elif name.startswith(keyword):
-            score += 90
-        else:
-            score += 40
-        if "国产动漫" in typ or "动漫" in typ:
-            score += 25
-        if any(s in name or s in typ for s in skip):
-            score -= 40
-        if "更新" in remarks:
-            score += 12
-        if score > best_score:
-            best_score = score
-            best = it
-    return best
-
-
-def load_home():
-    cached = cache_get("home")
-    if cached is not None:
-        return cached
-    week = {str(i): [] for i in range(1, 8)}
-    hot = []
-    src = SOURCE_MAP.get("ry") or SOURCES[0]
-    found = {}
-
-    # Vercel 函数有超时限制（Hobby 10s / Pro 60s），必须控制总耗时。
-    # 策略：设置总截止时间，逐个请求，超时即停止并返回已收集数据。
-    deadline = time.time() + 8  # 预留 2s 余量给序列化/网络
-
-    for meta in GUOMAN_TITLES:
-        if time.time() > deadline:
-            break
-        try:
-            items = search_one(src, meta["name"])
-        except Exception:
-            items = []
-        hit = pick_guoman(meta["name"], items)
-        if hit:
-            hit = dict(hit)
-            hit["weekday"] = meta["weekday"]
-            hit["kind"] = "week"
-            hit["pin"] = meta["pin"]
-            found[meta["name"]] = hit
-
-    ordered = sorted(found.values(), key=lambda x: x.get("pin") or 99)
-    for it in ordered:
-        day = str(it.get("weekday") or 1)
-        week.setdefault(day, []).append(it)
-        hot.append(it)
-
-    # 补充热门：同样受 deadline 约束
-    if time.time() < deadline:
-        extra_src = SOURCE_MAP.get("lz") or src
-        extra = fetch_json(extra_src["api"] + "?ac=detail&t=29&pg=1", timeout=3)
-        seen = {x.get("vod_name") for x in hot}
-        if extra and extra.get("list"):
-            for raw in extra["list"]:
-                if time.time() > deadline:
-                    break
-                it = normalize_item(raw, extra_src)
-                name = it.get("vod_name")
-                typ = it.get("type_name") or ""
-                if not name or name in seen:
-                    continue
-                if "短剧" in typ or "电影" in typ:
-                    continue
-                if "动漫" not in typ and "动画" not in typ:
-                    continue
-                seen.add(name)
-                hot.append(it)
-                if len(hot) >= 24:
-                    break
-
-    payload = {"week": week, "hot": hot[:30]}
-    cache_set("home", payload)
-    return payload
+def pick_guoman(items):
+    """从列表里优先挑出国漫标题，供首页精选。"""
+    hits = []
+    for t in GUOMAN_TITLES:
+        for it in items:
+            if t in it.get("title", ""):
+                hits.append(it)
+                break
+    return hits[:12]
